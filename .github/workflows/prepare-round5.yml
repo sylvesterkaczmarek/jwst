@@ -1,0 +1,86 @@
+name: Prepare round 5 JWST fixes
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  prepare:
+    if: github.head_ref == 'round5-validation'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Install JWST test environment
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e '.[test]'
+      - name: Prepare and test contribution branches
+        shell: bash
+        run: |
+          set -euo pipefail
+          BASE=313f4d61cb73e79b568dc368e63075f5cfc7e1f3
+          git config user.name 'Sylvester Kaczmarek'
+          git config user.email '16242628+sylvesterkaczmarek@users.noreply.github.com'
+
+          git switch -C fix-msaflagopen-crds-fetch "$BASE"
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path('jwst/msaflagopen/msaflagopen_step.py')
+          text = path.read_text()
+          text = text.replace(
+              'import logging\n\nfrom stpipe.crds_client import reference_uri_to_cache_path\n',
+              'import logging\nfrom pathlib import Path\n\nfrom crds import api as crds_api\nfrom stpipe.crds_client import get_context_used, reference_uri_to_cache_path\n',
+          )
+          old = '''    # Convert from crds protocol to absolute filenames\n    for key in ref_files.keys():\n        if ref_files[key].startswith("crds://"):\n            ref_files[key] = reference_uri_to_cache_path(\n                ref_files[key], input_model.crds_observatory\n            )\n    return ref_files\n'''
+          new = '''    # Convert CRDS URIs to local paths, fetching exact recorded references\n    # when they are not already present in the local cache.\n    for key, ref_file in ref_files.items():\n        if isinstance(ref_file, str) and ref_file.startswith("crds://"):\n            ref_files[key] = _reference_uri_to_local_path(ref_file, input_model)\n    return ref_files\n\n\ndef _reference_uri_to_local_path(reference_uri, input_model):\n    """Resolve a CRDS URI to a readable local reference-file path."""\n    cache_path = reference_uri_to_cache_path(reference_uri, input_model.crds_observatory)\n    if Path(cache_path).exists():\n        return cache_path\n\n    context = getattr(input_model.meta.ref_file.crds, "context_used", None)\n    if not context:\n        context = get_context_used(input_model.crds_observatory)\n\n    basename = reference_uri.removeprefix("crds://")\n    log.info("Fetching reference file %s using CRDS context %s", basename, context)\n    return crds_api.dump_references(context, [basename])[basename]\n'''
+          if old not in text:
+              raise SystemExit('MSAFlagOpen target block not found')
+          path.write_text(text.replace(old, new))
+
+          test = Path('jwst/msaflagopen/tests/test_msa_open.py')
+          t = test.read_text()
+          t = t.replace(
+              'from jwst.msaflagopen import MSAFlagOpenStep\n',
+              'from jwst.msaflagopen import MSAFlagOpenStep, msaflagopen_step\n',
+          )
+          t += '''\n\ndef test_reference_dictionary_fetches_uncached_crds_reference(monkeypatch, tmp_path):\n    model = ImageModel()\n    for ref_type in AssignWcsStep.reference_file_types:\n        getattr(model.meta.ref_file, ref_type).name = None\n\n    ref_type = AssignWcsStep.reference_file_types[0]\n    basename = "jwst_nirspec_test_0001.asdf"\n    getattr(model.meta.ref_file, ref_type).name = f"crds://{basename}"\n    model.meta.ref_file.crds.context_used = "jwst_1234.pmap"\n\n    uncached_path = tmp_path / basename\n    downloaded_path = tmp_path / "downloaded.asdf"\n    monkeypatch.setattr(\n        msaflagopen_step,\n        "reference_uri_to_cache_path",\n        lambda reference_uri, observatory: str(uncached_path),\n    )\n\n    calls = {}\n\n    def fake_dump_references(context, references):\n        calls["context"] = context\n        calls["references"] = references\n        return {basename: str(downloaded_path)}\n\n    monkeypatch.setattr(msaflagopen_step.crds_api, "dump_references", fake_dump_references)\n\n    result = msaflagopen_step.create_reference_filename_dictionary(model)\n\n    assert result[ref_type] == str(downloaded_path)\n    assert calls == {"context": "jwst_1234.pmap", "references": [basename]}\n    assert any(value is None for key, value in result.items() if key != ref_type)\n'''
+          test.write_text(t)
+          PY
+          pytest -q jwst/msaflagopen/tests/test_msa_open.py -k 'reference_dictionary_fetches_uncached_crds_reference or no_ref_file'
+          git add jwst/msaflagopen/msaflagopen_step.py jwst/msaflagopen/tests/test_msa_open.py
+          git commit -m 'Fetch uncached MSAFlagOpen WCS references'
+          git push --force origin fix-msaflagopen-crds-fetch
+
+          git switch -C fix-tsgrism-siaf-indexing "$BASE"
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path('jwst/assign_wcs/nircam.py')
+          text = path.read_text()
+          marker = '\ndef tsgrism(input_model, reference_files):\n'
+          helper = '''\ndef _get_tsgrism_source_center(input_model):\n    """Return the TSGRISM source reference position in 0-indexed WCS pixels."""\n    xc = input_model.meta.wcsinfo.siaf_xref_sci\n    yc = input_model.meta.wcsinfo.siaf_yref_sci\n\n    if xc is None:\n        raise ValueError("XREF_SCI is missing.")\n    if yc is None:\n        raise ValueError("YREF_SCI is missing.")\n\n    # SIAF XREF_SCI/YREF_SCI values stored in FITS metadata are 1-indexed,\n    # while GWCS detector/direct-image coordinates are 0-indexed.\n    return xc - 1, yc - 1\n\n'''
+          if marker not in text:
+              raise SystemExit('TSGRISM insertion point not found')
+          text = text.replace(marker, helper + marker, 1)
+          old = '''    xc, yc = (input_model.meta.wcsinfo.siaf_xref_sci, input_model.meta.wcsinfo.siaf_yref_sci)\n\n    if xc is None:\n        raise ValueError("XREF_SCI is missing.")\n\n    if yc is None:\n        raise ValueError("YREF_SCI is missing.")\n\n    xcenter = Const1D(xc)\n'''
+          new = '''    xc, yc = _get_tsgrism_source_center(input_model)\n\n    xcenter = Const1D(xc)\n'''
+          if old not in text:
+              raise SystemExit('TSGRISM source-centre block not found')
+          path.write_text(text.replace(old, new, 1))
+
+          test = Path('jwst/assign_wcs/tests/test_nircam_tsgrism_indexing.py')
+          test.write_text('''import pytest\nfrom stdatamodels.jwst.datamodels import CubeModel\n\nfrom jwst.assign_wcs.nircam import _get_tsgrism_source_center\n\n\ndef test_tsgrism_siaf_reference_position_is_converted_to_zero_indexing():\n    model = CubeModel((1, 2, 2))\n    model.meta.wcsinfo.siaf_xref_sci = 1024.5\n    model.meta.wcsinfo.siaf_yref_sci = 35.0\n\n    assert _get_tsgrism_source_center(model) == (1023.5, 34.0)\n    model.close()\n\n\ndef test_tsgrism_source_center_requires_siaf_reference_position():\n    model = CubeModel((1, 2, 2))\n    model.meta.wcsinfo.siaf_xref_sci = None\n    model.meta.wcsinfo.siaf_yref_sci = 35.0\n\n    with pytest.raises(ValueError, match="XREF_SCI is missing"):\n        _get_tsgrism_source_center(model)\n    model.close()\n''')
+          PY
+          pytest -q jwst/assign_wcs/tests/test_nircam_tsgrism_indexing.py
+          git add jwst/assign_wcs/nircam.py jwst/assign_wcs/tests/test_nircam_tsgrism_indexing.py
+          git commit -m 'Correct TSGRISM SIAF reference pixel indexing'
+          git push --force origin fix-tsgrism-siaf-indexing
