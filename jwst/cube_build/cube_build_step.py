@@ -52,6 +52,16 @@ class CubeBuildStep(Step):
 
     reference_file_types = ["cubepar"]
 
+    @staticmethod
+    def _resolve_coord_system(coord_system, cube_pa):
+        """Resolve coordinate-system precedence for an explicit cube position angle."""
+        if coord_system == "world":
+            coord_system = "skyalign"
+        if cube_pa is not None and coord_system == "ifualign":
+            log.info("cube_pa overrides coord_system=ifualign; using the requested sky position angle")
+            coord_system = "skyalign"
+        return coord_system
+
     def process(self, input_data):
         """
         Build an IFU cube from overlapping IFU image data.
@@ -137,8 +147,7 @@ class CubeBuildStep(Step):
         # 1. skyalign (ra dec) (aka world)
         # 2. ifualign (ifu cube aligned with slicer plane/ MRS local coord system)
         # 3. internal_cal (local IFU - ifu cubes built in local IFU system)
-        if self.coord_system == "world":
-            self.coord_system = "skyalign"
+        self.coord_system = self._resolve_coord_system(self.coord_system, self.cube_pa)
 
         self.interpolation = "pointcloud"  # initialize
 
@@ -534,7 +543,7 @@ class CubeBuildStep(Step):
 
             raise ValueError(
                 "Offset file is not correct. Offset file needs to have three lists: "
-                "filename, raoffset and decoffset all of the same length."
+                "filename, raoffset, decoffset all of the same length."
             ) from None
 
         offset_filename = af["filename"]
