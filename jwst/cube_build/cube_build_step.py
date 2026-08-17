@@ -58,7 +58,9 @@ class CubeBuildStep(Step):
         if coord_system == "world":
             coord_system = "skyalign"
         if cube_pa is not None and coord_system == "ifualign":
-            log.info("cube_pa overrides coord_system=ifualign; using the requested sky position angle")
+            log.info(
+                "cube_pa overrides coord_system=ifualign; using the requested sky position angle"
+            )
             coord_system = "skyalign"
         return coord_system
 
@@ -543,7 +545,7 @@ class CubeBuildStep(Step):
 
             raise ValueError(
                 "Offset file is not correct. Offset file needs to have three lists: "
-                "filename, raoffset, decoffset all of the same length."
+                "filename, raoffset and decoffset all of the same length."
             ) from None
 
         offset_filename = af["filename"]
