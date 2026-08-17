@@ -1,0 +1,108 @@
+name: Prepare round 6 JWST fixes
+
+on:
+  push:
+    branches: [round6-validation]
+
+permissions:
+  contents: write
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Install JWST test environment
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e '.[test]'
+      - name: Prepare and validate contribution branches
+        shell: bash
+        run: |
+          set -euo pipefail
+          BASE=313f4d61cb73e79b568dc368e63075f5cfc7e1f3
+          git config user.name 'Sylvester Kaczmarek'
+          git config user.email '16242628+sylvesterkaczmarek@users.noreply.github.com'
+
+          # 1. Reject imaging inputs in Spec2Pipeline.
+          git switch -C reject-imaging-spec2-input "$BASE"
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path('jwst/pipeline/calwebb_spec2.py')
+          text = path.read_text()
+          marker = 'TA_TYPES = ["MIR_LRS-FIXEDSLIT", "MIR_LRS-SLITLESS"]\n\n'
+          helper = '''TA_TYPES = ["MIR_LRS-FIXEDSLIT", "MIR_LRS-SLITLESS"]\nIMAGE_TYPES = {"MIR_IMAGE", "NRC_IMAGE", "NIS_IMAGE", "FGS_IMAGE"}\n\n\ndef _validate_spec2_exposure_type(exp_type):\n    """Reject standard imaging exposures passed to the spectroscopic pipeline."""\n    if exp_type in IMAGE_TYPES:\n        raise ValueError(\n            f"Exposure type {exp_type} is imaging data and is not supported by "\n            "Spec2Pipeline; use Image2Pipeline instead."\n        )\n\n'''
+          if marker not in text:
+              raise SystemExit('Spec2 constant insertion point not found')
+          text = text.replace(marker, helper, 1)
+          old = '        exp_type = science.meta.exposure.type\n        if isinstance(science, datamodels.CubeModel):\n'
+          new = '        exp_type = science.meta.exposure.type\n        _validate_spec2_exposure_type(exp_type)\n        if isinstance(science, datamodels.CubeModel):\n'
+          if old not in text:
+              raise SystemExit('Spec2 validation call insertion point not found')
+          path.write_text(text.replace(old, new, 1))
+
+          test = Path('jwst/pipeline/tests/test_spec2_input_validation.py')
+          test.write_text('''import pytest\n\nfrom jwst.pipeline.calwebb_spec2 import _validate_spec2_exposure_type\n\n\n@pytest.mark.parametrize("exp_type", ["MIR_IMAGE", "NRC_IMAGE", "NIS_IMAGE", "FGS_IMAGE"])\ndef test_spec2_rejects_imaging_exposure_types(exp_type):\n    with pytest.raises(ValueError, match="imaging data"):\n        _validate_spec2_exposure_type(exp_type)\n\n\ndef test_spec2_accepts_spectroscopic_exposure_type():\n    _validate_spec2_exposure_type("NRS_FIXEDSLIT")\n''')
+          PY
+          pytest -q jwst/pipeline/tests/test_spec2_input_validation.py
+          git add jwst/pipeline/calwebb_spec2.py jwst/pipeline/tests/test_spec2_input_validation.py
+          git commit -m 'Reject imaging inputs in Spec2Pipeline'
+          git push --force origin reject-imaging-spec2-input
+
+          # 2. Raise an informative error when ramp fitting produces no slope products.
+          git switch -C error-empty-ramp-fit-output "$BASE"
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path('jwst/ramp_fitting/ramp_fit_step.py')
+          text = path.read_text()
+          marker = '\n\nclass RampFitStep(Step):\n'
+          helper = '''\n\ndef _validate_ramp_fit_outputs(image_info, integ_info):\n    """Require ramp fitting to produce both exposure- and integration-level slopes."""\n    if image_info is None or integ_info is None:\n        raise RuntimeError(\n            "Ramp fitting did not produce slope products; the input may contain no usable ramps."\n        )\n\n'''
+          if marker not in text:
+              raise SystemExit('RampFit helper insertion point not found')
+          text = text.replace(marker, helper + marker, 1)
+          old = '''        image_info, integ_info, opt_info = ramp_fit.ramp_fit(\n            result,\n            self.save_opt,\n            readnoise_2d,\n            gain_2d,\n            self.algorithm,\n            self.weighting,\n            max_cores,\n            dqflags.pixel,\n            suppress_one_group=self.suppress_one_group,\n        )\n\n        # Save the OLS_C optional fit product, if it exists.\n'''
+          new = '''        image_info, integ_info, opt_info = ramp_fit.ramp_fit(\n            result,\n            self.save_opt,\n            readnoise_2d,\n            gain_2d,\n            self.algorithm,\n            self.weighting,\n            max_cores,\n            dqflags.pixel,\n            suppress_one_group=self.suppress_one_group,\n        )\n        _validate_ramp_fit_outputs(image_info, integ_info)\n\n        # Save the OLS_C optional fit product, if it exists.\n'''
+          if old not in text:
+              raise SystemExit('RampFit validation call insertion point not found')
+          path.write_text(text.replace(old, new, 1))
+
+          test = Path('jwst/ramp_fitting/tests/test_ramp_fit_empty_output.py')
+          test.write_text('''import pytest\n\nfrom jwst.ramp_fitting.ramp_fit_step import _validate_ramp_fit_outputs\n\n\ndef test_ramp_fit_output_validation_accepts_products():\n    _validate_ramp_fit_outputs({"slope": object()}, {"slope": object()})\n\n\n@pytest.mark.parametrize(\n    "image_info, integ_info",\n    [(None, None), ({"slope": object()}, None), (None, {"slope": object()})],\n)\ndef test_ramp_fit_output_validation_rejects_missing_products(image_info, integ_info):\n    with pytest.raises(RuntimeError, match="did not produce slope products"):\n        _validate_ramp_fit_outputs(image_info, integ_info)\n''')
+          PY
+          pytest -q jwst/ramp_fitting/tests/test_ramp_fit_empty_output.py
+          git add jwst/ramp_fitting/ramp_fit_step.py jwst/ramp_fitting/tests/test_ramp_fit_empty_output.py
+          git commit -m 'Fail clearly when ramp fitting produces no slopes'
+          git push --force origin error-empty-ramp-fit-output
+
+          # 3. Reject even user-specified IFU cube dimensions instead of silently mutating them.
+          git switch -C reject-even-cube-nspax "$BASE"
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path('jwst/cube_build/cube_build_step.py')
+          text = path.read_text()
+          marker = '\n\nclass CubeBuildStep(Step):\n'
+          helper = '''\n\ndef _validate_nspax(value, name):\n    """Validate a user-specified cube tangent-plane dimension."""\n    if value is not None and value % 2 == 0:\n        raise ValueError(f"{name} must be an odd integer; got {value}.")\n\n'''
+          if marker not in text:
+              raise SystemExit('CubeBuild helper insertion point not found')
+          text = text.replace(marker, helper + marker, 1)
+          old = '''        # check that if self.nspax_x or self.nspax_y is provided they must be odd numbers\n        if self.nspax_x is not None:\n            if self.nspax_x % 2 == 0:\n                log.info(f"Input nspax_x must be an odd number {self.nspax_x}")\n                self.nspax_x = self.nspax_x + 1\n                log.info(f"Updating nspa by 1. New value {self.nspax_x}")\n\n        if self.nspax_y is not None:\n            if self.nspax_y % 2 == 0:\n                log.info(f"Input nspax_y must be an odd number {self.nspax_y}")\n                self.nspax_y = self.nspax_y + 1\n                log.info(f"Updating nspax_y by 1. New value {self.nspax_y}")\n'''
+          new = '''        # User-specified tangent-plane dimensions must be odd.  Do not silently\n        # change them: downstream cube geometry and compiled mapping code must agree\n        # on the exact dimensions supplied to the build.\n        _validate_nspax(self.nspax_x, "nspax_x")\n        _validate_nspax(self.nspax_y, "nspax_y")\n'''
+          if old not in text:
+              raise SystemExit('CubeBuild nspax validation block not found')
+          path.write_text(text.replace(old, new, 1))
+
+          test = Path('jwst/cube_build/tests/test_cube_nspax_validation.py')
+          test.write_text('''import pytest\n\nfrom jwst.cube_build.cube_build_step import _validate_nspax\n\n\n@pytest.mark.parametrize("value", [1, 81, 101, None])\ndef test_nspax_accepts_odd_or_unset_values(value):\n    _validate_nspax(value, "nspax_x")\n\n\n@pytest.mark.parametrize("value", [0, 80, 100])\ndef test_nspax_rejects_even_values(value):\n    with pytest.raises(ValueError, match="must be an odd integer"):\n        _validate_nspax(value, "nspax_x")\n''')
+          PY
+          pytest -q jwst/cube_build/tests/test_cube_nspax_validation.py
+          git add jwst/cube_build/cube_build_step.py jwst/cube_build/tests/test_cube_nspax_validation.py
+          git commit -m 'Reject even IFU cube dimensions'
+          git push --force origin reject-even-cube-nspax
