@@ -1,0 +1,208 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+git config user.name 'Sylvester Kaczmarek'
+git config user.email '16242628+sylvesterkaczmarek@users.noreply.github.com'
+git fetch origin main
+
+# 1. Support single-model / single-file input in Spec3Pipeline.
+git checkout -B fix-spec3-single-model-input origin/main
+python - <<'PY'
+from pathlib import Path
+
+path = Path('jwst/pipeline/calwebb_spec3.py')
+text = path.read_text()
+text = text.replace(
+    'from jwst.datamodels import SourceModelContainer\n',
+    'from jwst.datamodels import ModelContainer, SourceModelContainer\n',
+    1,
+)
+old = '        input_models = self.prepare_output(input_data, asn_exptypes=asn_exptypes)\n'
+new = '        input_models = self._load_input_as_container(input_data, asn_exptypes)\n'
+if old not in text:
+    raise RuntimeError('Spec3 input-loading call not found')
+text = text.replace(old, new, 1)
+marker = '    def _create_nrsfs_slit_name(self, source_models):\n'
+helper = '''    def _load_input_as_container(self, input_data, asn_exptypes):
+        """Load Spec3 input, wrapping a single model or model file in a container."""
+        if isinstance(input_data, dm.JwstDataModel):
+            return ModelContainer([self.prepare_output(input_data)])
+
+        if isinstance(input_data, (str, Path)):
+            suffix = Path(input_data).suffix.lower()
+            if suffix in {".fits", ".asdf"}:
+                return ModelContainer([self.prepare_output(input_data)])
+
+        return self.prepare_output(input_data, asn_exptypes=asn_exptypes)
+
+'''
+if marker not in text:
+    raise RuntimeError('Spec3 helper insertion point not found')
+text = text.replace(marker, helper + marker, 1)
+path.write_text(text)
+PY
+cat > jwst/pipeline/tests/test_calwebb_spec3_single_input.py <<'PY'
+import numpy as np
+from stdatamodels.jwst import datamodels
+
+from jwst.datamodels import ModelContainer
+from jwst.pipeline.calwebb_spec3 import Spec3Pipeline
+
+
+def test_load_single_datamodel_as_container():
+    model = datamodels.ImageModel(data=np.ones((2, 2)))
+    model.meta.filename = "jw00001_cal.fits"
+    pipeline = Spec3Pipeline()
+    result = pipeline._load_input_as_container(model, ["science", "background"])
+    try:
+        assert isinstance(result, ModelContainer)
+        assert len(result) == 1
+        assert result.asn_table["products"][0]["name"] == "jw00001"
+    finally:
+        result.close()
+        model.close()
+
+
+def test_load_single_fits_as_container(tmp_path):
+    path = tmp_path / "jw00002_cal.fits"
+    with datamodels.ImageModel(data=np.ones((2, 2))) as model:
+        model.save(path)
+    pipeline = Spec3Pipeline()
+    result = pipeline._load_input_as_container(str(path), ["science", "background"])
+    try:
+        assert isinstance(result, ModelContainer)
+        assert len(result) == 1
+        assert result.asn_table["products"][0]["name"] == "jw00002"
+    finally:
+        result.close()
+PY
+pytest -q jwst/pipeline/tests/test_calwebb_spec3_single_input.py
+git add jwst/pipeline/calwebb_spec3.py jwst/pipeline/tests/test_calwebb_spec3_single_input.py
+git commit -m 'Support single-model input in Spec3Pipeline'
+git push --force origin fix-spec3-single-model-input
+
+# 2. Remove incorrect source-catalog warnings in WFSS background subtraction.
+git checkout -B fix-wfss-background-logging origin/main
+python - <<'PY'
+from pathlib import Path
+
+path = Path('jwst/background/background_sub_wfss.py')
+text = path.read_text()
+bad = '''            log.warning("No source_catalog found in input.meta, and custom mask not specified. ")
+            log.warning("No sources will be masked for background scaling.")
+'''
+if bad not in text:
+    raise RuntimeError('Incorrect WFSS warning block not found')
+path.write_text(text.replace(bad, '', 1))
+PY
+cat > jwst/background/tests/test_wfss_catalog_logging.py <<'PY'
+import logging
+
+import numpy as np
+from stdatamodels.jwst import datamodels
+
+from jwst.background import background_sub_wfss
+
+
+def test_catalog_mask_does_not_log_missing_catalog(monkeypatch, caplog):
+    model = datamodels.ImageModel(
+        data=np.ones((4, 4)),
+        err=np.ones((4, 4)),
+        dq=np.zeros((4, 4), dtype=np.uint32),
+    )
+    model.meta.source_catalog = "catalog.ecsv"
+    model.meta.wcsinfo.dispersion_direction = 1
+    bkg = datamodels.ImageModel(
+        data=np.ones((4, 4)),
+        dq=np.zeros((4, 4), dtype=np.uint32),
+    )
+    monkeypatch.setattr(background_sub_wfss.datamodels, "open", lambda _: bkg)
+    monkeypatch.setattr(
+        background_sub_wfss, "get_subarray_model", lambda science, reference: reference
+    )
+    monkeypatch.setattr(
+        background_sub_wfss,
+        "_mask_from_source_cat",
+        lambda *args, **kwargs: np.zeros((4, 4), dtype=bool),
+    )
+    with caplog.at_level(logging.WARNING, logger=background_sub_wfss.__name__):
+        result = background_sub_wfss.subtract_wfss_bkg(
+            model, "background.fits", "wavelengthrange.asdf"
+        )
+    try:
+        assert result.meta.cal_step.bkg_subtract == "FAILED"
+        assert "No source_catalog found" not in caplog.text
+        assert "No sources will be masked" not in caplog.text
+        assert "Not enough background pixels" in caplog.text
+    finally:
+        result.close()
+PY
+pytest -q jwst/background/tests/test_wfss_catalog_logging.py
+git add jwst/background/background_sub_wfss.py jwst/background/tests/test_wfss_catalog_logging.py
+git commit -m 'Fix WFSS source-catalog warning messages'
+git push --force origin fix-wfss-background-logging
+
+# 3. Warn before allocating unusually large IFU cubes.
+git checkout -B warn-large-ifu-cubes origin/main
+python - <<'PY'
+from pathlib import Path
+
+path = Path('jwst/cube_build/ifu_cube.py')
+text = path.read_text()
+marker = '__all__ = ["IFUCubeData", "IncorrectInputError", "IncorrectParameterError"]\n\n\n'
+helper = '''__all__ = ["IFUCubeData", "IncorrectInputError", "IncorrectParameterError"]
+
+LARGE_CUBE_VOXEL_THRESHOLD = 100_000_000
+
+
+def _check_cube_size(naxis1, naxis2, naxis3):
+    """Return the cube voxel count and warn for unusually large allocations."""
+    total_num = naxis1 * naxis2 * naxis3
+    if total_num > LARGE_CUBE_VOXEL_THRESHOLD:
+        log.warning(
+            "Requested IFU cube has %d voxels (%d x %d x %d), exceeding the "
+            "%d-voxel warning threshold. Cube allocation may fail; check input "
+            "coverage and cube sampling.",
+            total_num,
+            naxis1,
+            naxis2,
+            naxis3,
+            LARGE_CUBE_VOXEL_THRESHOLD,
+        )
+    return total_num
+
+
+'''
+if marker not in text:
+    raise RuntimeError('IFU cube helper insertion point not found')
+text = text.replace(marker, helper, 1)
+old = '        total_num = self.naxis1 * self.naxis2 * self.naxis3\n'
+new = '        total_num = _check_cube_size(self.naxis1, self.naxis2, self.naxis3)\n'
+if old not in text:
+    raise RuntimeError('IFU cube allocation size calculation not found')
+path.write_text(text.replace(old, new, 1))
+PY
+cat > jwst/cube_build/tests/test_cube_size_warning.py <<'PY'
+import logging
+
+from jwst.cube_build.ifu_cube import _check_cube_size
+
+
+def test_typical_cube_does_not_warn(caplog):
+    with caplog.at_level(logging.WARNING, logger="jwst.cube_build.ifu_cube"):
+        total = _check_cube_size(60, 60, 8000)
+    assert total == 28_800_000
+    assert "exceeding" not in caplog.text
+
+
+def test_large_cube_warns_before_allocation(caplog):
+    with caplog.at_level(logging.WARNING, logger="jwst.cube_build.ifu_cube"):
+        total = _check_cube_size(1001, 1001, 100)
+    assert total == 100_200_100
+    assert "100200100 voxels" in caplog.text
+    assert "100000000-voxel warning threshold" in caplog.text
+PY
+pytest -q jwst/cube_build/tests/test_cube_size_warning.py
+git add jwst/cube_build/ifu_cube.py jwst/cube_build/tests/test_cube_size_warning.py
+git commit -m 'Warn before allocating unusually large IFU cubes'
+git push --force origin warn-large-ifu-cubes
