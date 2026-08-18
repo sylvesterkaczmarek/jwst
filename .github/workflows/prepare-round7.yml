@@ -1,0 +1,124 @@
+name: Prepare round 7 JWST fixes
+
+on:
+  pull_request:
+
+permissions:
+  contents: write
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Install JWST test environment
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e '.[test]'
+      - name: Prepare and validate contribution branches
+        shell: bash
+        run: |
+          set -euo pipefail
+          BASE=313f4d61cb73e79b568dc368e63075f5cfc7e1f3
+          git config user.name 'Sylvester Kaczmarek'
+          git config user.email '16242628+sylvesterkaczmarek@users.noreply.github.com'
+
+          # 1. Mark invalid skymatch solutions as FAILED, not SKIPPED.
+          git switch -C skymatch-failed-status "$BASE"
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path('jwst/skymatch/skymatch_step.py')
+          text = path.read_text()
+          old = '''                    self._set_sky_background(\n                        im, library, "COMPLETE" if im.is_sky_valid else "SKIPPED"\n                    )\n'''
+          new = '''                    self._set_sky_background(\n                        im, library, _sky_match_status(im.is_sky_valid)\n                    )\n'''
+          if old not in text:
+              raise SystemExit('SkyImage status block not found')
+          text = text.replace(old, new, 1)
+          old = '''                        self._set_sky_background(\n                            gim, library, "COMPLETE" if gim.is_sky_valid else "SKIPPED"\n                        )\n'''
+          new = '''                        self._set_sky_background(\n                            gim, library, _sky_match_status(gim.is_sky_valid)\n                        )\n'''
+          if old not in text:
+              raise SystemExit('SkyGroup status block not found')
+          text = text.replace(old, new, 1)
+          marker = '\n\nclass SkyMatchStep(Step):\n'
+          helper = '''\n\ndef _sky_match_status(is_sky_valid):\n    """Return the calibration-step status for a sky-matching result."""\n    return "COMPLETE" if is_sky_valid else "FAILED"\n\n'''
+          if marker not in text:
+              raise SystemExit('SkyMatch helper insertion point not found')
+          text = text.replace(marker, helper + marker, 1)
+          text = text.replace(
+              "            'COMPLETE', 'SKIPPED'.\n",
+              "            'COMPLETE', 'FAILED'.\n",
+              1,
+          )
+          path.write_text(text)
+
+          test = Path('jwst/skymatch/tests/test_failure_status.py')
+          test.write_text('''import pytest\n\nfrom jwst.skymatch.skymatch_step import _sky_match_status\n\n\n@pytest.mark.parametrize(\n    "is_valid, expected",\n    [(True, "COMPLETE"), (False, "FAILED")],\n)\ndef test_sky_match_status(is_valid, expected):\n    assert _sky_match_status(is_valid) == expected\n''')
+          PY
+          pytest -q jwst/skymatch/tests/test_failure_status.py
+          git add jwst/skymatch/skymatch_step.py jwst/skymatch/tests/test_failure_status.py
+          git commit -m 'Mark failed skymatch solutions as FAILED'
+          git push --force origin skymatch-failed-status
+
+          # 2. Preserve contextual traceback information for TweakReg failures.
+          git switch -C tweakreg-failure-diagnostics "$BASE"
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path('jwst/tweakreg/tweakreg_step.py')
+          text = path.read_text()
+          old = '''            except twk.TweakregError as e:\n                log.warning(str(e))\n                local_align_failed = True\n'''
+          new = '''            except twk.TweakregError as e:\n                _log_alignment_failure("Relative", e)\n                local_align_failed = True\n'''
+          if old not in text:
+              raise SystemExit('Relative alignment failure block not found')
+          text = text.replace(old, new, 1)
+          old = '''                except twk.TweakregError as e:\n                    log.warning(str(e))\n                    images.shelve(ref_image, 0, modify=False)\n'''
+          new = '''                except twk.TweakregError as e:\n                    _log_alignment_failure("Absolute", e)\n                    images.shelve(ref_image, 0, modify=False)\n'''
+          if old not in text:
+              raise SystemExit('Absolute alignment failure block not found')
+          text = text.replace(old, new, 1)
+          marker = '\n\nSINGLE_GROUP_REFCAT = '
+          helper = '''\n\ndef _log_alignment_failure(kind, error):\n    """Log alignment failures with operation context and traceback details."""\n    log.warning(f"{kind} alignment failed: {error}", exc_info=True)\n\n'''
+          if marker not in text:
+              raise SystemExit('TweakReg helper insertion point not found')
+          text = text.replace(marker, helper + marker, 1)
+          path.write_text(text)
+
+          test = Path('jwst/tweakreg/tests/test_failure_diagnostics.py')
+          test.write_text('''import logging\n\nimport stcal.tweakreg.tweakreg as twk\n\nfrom jwst.tweakreg.tweakreg_step import _log_alignment_failure\n\n\ndef test_alignment_failure_logs_context_and_traceback(caplog):\n    caplog.set_level(logging.WARNING, logger="jwst.tweakreg.tweakreg_step")\n    try:\n        raise twk.TweakregError("not enough matches")\n    except twk.TweakregError as error:\n        _log_alignment_failure("Relative", error)\n\n    assert "Relative alignment failed: not enough matches" in caplog.text\n    assert "TweakregError" in caplog.text\n''')
+          PY
+          pytest -q jwst/tweakreg/tests/test_failure_diagnostics.py
+          git add jwst/tweakreg/tweakreg_step.py jwst/tweakreg/tests/test_failure_diagnostics.py
+          git commit -m 'Preserve TweakReg failure diagnostics'
+          git push --force origin tweakreg-failure-diagnostics
+
+          # 3. Attach physical day units to white-light timing columns.
+          git switch -C white-light-time-units "$BASE"
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path('jwst/white_light/white_light.py')
+          text = path.read_text()
+          old = '''        tbl[f"MJD_UTC{detector_name}"] = mjd\n        tbl[f"BJD_TDB{detector_name}"] = bjd\n'''
+          new = '''        tbl[f"MJD_UTC{detector_name}"] = mjd << u.day\n        tbl[f"BJD_TDB{detector_name}"] = bjd << u.day\n'''
+          if old not in text:
+              raise SystemExit('White-light time-column block not found')
+          path.write_text(text.replace(old, new, 1))
+
+          test = Path('jwst/white_light/tests/test_white_light.py')
+          t = test.read_text()
+          old = '''    np.testing.assert_allclose(result["MJD_UTC"], mid_times)\n    np.testing.assert_allclose(result["BJD_TDB"], expected_tdb, equal_nan=True)\n'''
+          new = '''    np.testing.assert_allclose(result["MJD_UTC"], mid_times)\n    np.testing.assert_allclose(result["BJD_TDB"], expected_tdb, equal_nan=True)\n    assert result["MJD_UTC"].unit == u.day\n    assert result["BJD_TDB"].unit == u.day\n'''
+          if old not in t:
+              raise SystemExit('White-light test assertion block not found')
+          test.write_text(t.replace(old, new, 1))
+          PY
+          pytest -q jwst/white_light/tests/test_white_light.py
+          git add jwst/white_light/white_light.py jwst/white_light/tests/test_white_light.py
+          git commit -m 'Add units to white-light timing columns'
+          git push --force origin white-light-time-units
