@@ -1,0 +1,64 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+BASE=313f4d61cb73e79b568dc368e63075f5cfc7e1f3
+BRANCH=standalone-imprint-association
+
+git config user.name 'Sylvester Kaczmarek'
+git config user.email '16242628+sylvesterkaczmarek@users.noreply.github.com'
+git switch -C "$BRANCH" "$BASE"
+
+python - <<'PY'
+from pathlib import Path
+
+path = Path('jwst/imprint/imprint_step.py')
+text = path.read_text()
+
+old = '    def process(self, input_data, imprint):\n'
+new = '    def process(self, input_data, imprint=None):\n'
+if old not in text:
+    raise SystemExit('imprint process signature not found')
+text = text.replace(old, new, 1)
+
+old = (
+    '        input_data : str or `~stdatamodels.jwst.datamodels.JwstDataModel`\n'
+    '            Input exposure to be corrected.\n'
+    '        imprint : list of str or `~stdatamodels.jwst.datamodels.JwstDataModel`\n'
+    '            Imprint exposures associated with the input.\n'
+)
+new = (
+    '        input_data : str, association, or `~stdatamodels.jwst.datamodels.JwstDataModel`\n'
+    '            Input exposure to be corrected, or a Level 2 association containing\n'
+    '            the science and imprint exposures.\n'
+    '        imprint : list of str or `~stdatamodels.jwst.datamodels.JwstDataModel`, optional\n'
+    '            Imprint exposures associated with the input. If not provided,\n'
+    '            ``input_data`` is loaded as a Level 2 association.\n'
+)
+if old not in text:
+    raise SystemExit('imprint docstring block not found')
+text = text.replace(old, new, 1)
+
+marker = '        # Open the input science image and get its dither pattern position number\n'
+insert = '''        if imprint is None:\n            association = self.load_as_level2_asn(input_data)\n            input_data, imprint = self._asn_get_data(association)\n\n'''
+if marker not in text:
+    raise SystemExit('imprint process insertion point not found')
+text = text.replace(marker, insert + marker, 1)
+
+marker = '    def process(self, input_data, imprint=None):\n'
+helper = '''    @staticmethod\n    def _asn_get_data(association):\n        """Return the science and imprint members from a Level 2 association."""\n        products = association["products"]\n        if len(products) > 1:\n            log.warning("Multiple products in input association. Using only the first one.")\n\n        product = products[0]\n        science = []\n        imprints = []\n        for member in product["members"]:\n            exptype = member["exptype"].lower()\n            if exptype == "science":\n                science.append(member["expname"])\n            elif exptype == "imprint":\n                imprints.append(member["expname"])\n\n        if len(science) == 0:\n            raise ValueError("No science exposure found in input association")\n        if len(science) > 1:\n            log.warning("Multiple science exposures in input association. Using only the first one.")\n\n        log.info("Working on input %s ...", science[0])\n        return science[0], imprints\n\n'''
+if marker not in text:
+    raise SystemExit('imprint helper insertion point not found')
+text = text.replace(marker, helper + marker, 1)
+path.write_text(text)
+
+test_path = Path('jwst/imprint/tests/test_imprint.py')
+tests = test_path.read_text()
+tests += '''\n\ndef test_step_association_input(tmp_path):\n    """A Level 2 association can drive standalone imprint subtraction."""\n    science = make_imagemodel(10, 10, value=3.0)\n    science.meta.filename = "science.fits"\n    science_path = tmp_path / science.meta.filename\n    science.save(science_path)\n\n    imprint = make_imagemodel(10, 10, value=1.0)\n    imprint.meta.filename = "imprint.fits"\n    imprint_path = tmp_path / imprint.meta.filename\n    imprint.save(imprint_path)\n\n    association = {\n        "asn_type": "spec2",\n        "asn_rule": "DMSLevel2bBase",\n        "version_id": None,\n        "code_version": "0.0.0",\n        "degraded_status": "No known degraded exposures in association.",\n        "program": "00001",\n        "constraints": "No constraints",\n        "asn_id": "a3001",\n        "asn_pool": "none",\n        "products": [\n            {\n                "name": "test_product",\n                "members": [\n                    {"expname": str(science_path), "exptype": "science"},\n                    {"expname": str(imprint_path), "exptype": "imprint"},\n                ],\n            }\n        ],\n    }\n\n    result = ImprintStep.call(association)\n\n    assert result.meta.cal_step.imprint_subtract == "COMPLETE"\n    assert np.all(result.data == 2.0)\n\n\ndef test_asn_get_data_without_imprint():\n    """An association without an imprint remains a valid no-op input."""\n    association = {\n        "products": [\n            {\n                "name": "test_product",\n                "members": [{"expname": "science.fits", "exptype": "science"}],\n            }\n        ]\n    }\n\n    science, imprints = ImprintStep._asn_get_data(association)\n\n    assert science == "science.fits"\n    assert imprints == []\n'''
+test_path.write_text(tests)
+PY
+
+pytest -q jwst/imprint/tests/test_imprint.py
+
+git add jwst/imprint/imprint_step.py jwst/imprint/tests/test_imprint.py
+git commit -m 'Support Level 2 associations in imprint_subtract'
+git push --force origin "$BRANCH"
